@@ -1,0 +1,382 @@
+use core::ptr::null;
+use core::sync::atomic::{AtomicUsize, Ordering, AtomicPtr, AtomicU8, AtomicIsize};
+use std::marker::PhantomData;
+use std::ptr::null_mut;
+use std::sync::Arc;
+use std::usize;
+
+const SEGMENT_SIZE: usize = 1024;
+
+const MAX_TRY_FAST_ENQUEUE: usize = 5;
+const MAX_PATIENCE: usize = 5;
+const MAX_SPIN: usize = 100;
+
+
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+fn pause() {
+    unsafe {
+        core::arch::asm!("PAUSE");
+    }
+}
+
+struct Value<T> {
+    p: PhantomData<T>,
+}
+
+struct EnqueueRequest<T> {
+    id: AtomicIsize,
+    value: AtomicPtr<T>,
+}
+
+impl<T> EnqueueRequest<T> {
+    const TOP: *mut Self = usize::MAX as *mut Self;
+    const BOT: *mut Self = usize::MIN as *mut Self;
+}
+
+struct DequeueRequest {
+    id: AtomicIsize,
+}
+
+impl DequeueRequest {
+    const TOP: *mut Self = usize::MAX as *mut Self;
+    const BOT: *mut Self = usize::MIN as *mut Self;
+}
+
+struct Cell<T> {
+    value: AtomicPtr<T>,
+    enq_req: AtomicPtr<EnqueueRequest<T>>,
+    deq_req: AtomicPtr<DequeueRequest>,
+}
+
+struct Segment<T> {
+    id: isize,
+    next: *mut Self,
+    cells: [Cell<T>; SEGMENT_SIZE],
+}
+
+struct Node<T> {
+    next: AtomicPtr<Node<T>>,
+    id: isize,
+    cells: *mut Segment<T>,
+}
+
+fn new_node<T>() -> *mut Node<T> {
+    let node = Box::new(Node{
+        next: AtomicPtr::new(null_mut()),
+        id: 0,
+        cells: null_mut(),
+    });
+    Box::into_raw(node) as *mut Node<T>
+}
+
+struct Handle<T> {
+    head: AtomicIsize,
+    tail: AtomicIsize,
+
+    head_node: *mut Node<T>,
+    tail_node: *mut Node<T>,
+    spare:     *mut Node<T>,
+    next:      *mut Handle<T>,
+    enq_req:   EnqueueRequest<T>,
+    deq_req:   DequeueRequest,
+    
+    eh: *mut Handle<T>,
+    dh: *mut Handle<T>,
+}
+
+pub struct UnboundedMPMCQueue<T: Sized + Send> {
+    q: *const Segment<T>,
+    head: AtomicIsize,
+    tail: AtomicIsize,
+    head_node: Node<T>,
+    tail_node: Node<T>,
+    num_procs: usize,
+}
+
+impl<T> Value<T> {
+    const TOP: *mut T = usize::MAX as *mut T;
+    const BOT: *mut T = usize::MIN as *mut T;
+}
+
+impl<T: Sized + Send> UnboundedMPMCQueue<T> {
+
+
+    pub fn new(num_procs: usize) -> Self {
+        let node1 = Node::<T>{
+            next: AtomicPtr::new(null_mut()),
+            id: 0,
+            cells: null_mut(),
+        };
+        let node2 = Node::<T>{
+            next: AtomicPtr::new(null_mut()),
+            id: 0,
+            cells: null_mut(),
+        };
+
+        Self {
+            q:null(),
+            head: AtomicIsize::new(0),
+            tail: AtomicIsize::new(0),
+            head_node: node1,
+            tail_node: node2,
+            num_procs: num_procs,
+        }
+    }
+
+    pub fn split(self) -> (Producer<T>, Consumer<T>) {
+        let inner = Arc::new(self);
+        (
+            Producer{inner: inner.clone()},
+            Consumer{inner: inner},
+        )
+    }
+
+    fn find_cell(&self, node: &mut *mut Node<T>, index: isize, spare: &mut *mut Node<T>) -> *mut Cell<T> {
+        unsafe {
+            let mut current = *node;
+            let mut current_id = (*current).id;
+    
+            while current_id < index / (SEGMENT_SIZE as isize) {
+                let mut next = (*current).next.load(Ordering::Relaxed);
+    
+                if next == null_mut() {
+                    let mut temp = *spare;
+    
+                    if temp == null_mut() {
+                        temp = new_node();
+                        *spare = temp;
+                    }
+    
+                    (*temp).id = current_id + 1;
+                    
+                    if (*current).next.compare_exchange(
+                        next, 
+                        temp as *mut Node<T>, 
+                        Ordering::Release, 
+                        Ordering::Acquire,
+                    ).is_ok() {
+                        next = temp as *mut Node<T>;
+                        *spare = null_mut();
+                    }
+                }
+                current = next;
+                current_id += 1;
+            }
+    
+            *node = current;
+    
+            unsafe{&mut(*(*current).cells).cells[index as usize % (SEGMENT_SIZE)]}
+        }
+    }
+}
+
+pub struct Producer<T: Sized + Send> {
+    inner: Arc<UnboundedMPMCQueue<T>>,
+}
+
+unsafe impl<T: Send> Send for Producer<T> {}
+
+impl<T: Sized + Send> Producer<T> {
+
+    fn enqueue(&self, value: Box<T>, thread_handle: &mut Handle<T>) {
+        let mut index: isize = unsafe{ core::mem::MaybeUninit::uninit().assume_init() }; 
+        let mut times = MAX_TRY_FAST_ENQUEUE;
+
+        loop {
+            match self.enqueue_fast(value, thread_handle, index) {
+                Ok(_) => break,
+                Err((new_index, reserve)) => {
+                    index = new_index;
+                    value = reserve;
+                }
+            }
+            times -= 1;
+            if times <= 0 { break; }
+        }
+
+        if times < 0 {
+            self.enqueue_slow(value, thread_handle, index);
+        }
+    }
+
+    fn enqueue_fast(&self, value: Box<T>, thread_handle: &mut Handle<T>, index: isize) -> Result<(), (isize, Box<T>)> {
+        unsafe {
+            let i = self.inner.tail.fetch_add(1, Ordering::SeqCst); // TODO: 
+            let cell = self.inner.find_cell(
+                &mut (*thread_handle).tail_node, 
+                i, 
+                &mut (*thread_handle).spare,
+            );
+            let value = Box::into_raw(value);
+
+            match (*cell).value.compare_exchange(
+                Value::BOT, value.clone(), 
+                Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => Ok(()),
+                Err(_) => Err((i, Box::from_raw(value))),
+            }
+        }
+    }
+
+    fn enqueue_slow(&self, value: Box<T>, thread_handle: &mut Handle<T>, mut index: isize) {
+        unsafe {
+            let enq_req = &mut thread_handle.enq_req;
+            enq_req.value.store(Box::into_raw(value), Ordering::Relaxed);
+            enq_req.id.store(index, Ordering::Release);
+
+
+            let mut tail = (*thread_handle).tail_node.clone();
+            let mut i = 0;
+            let mut cell = null_mut();
+            let value = Box::into_raw(value);
+
+            loop {
+                i = self.inner.tail.fetch_add(1, Ordering::Relaxed);
+                cell = self.inner.find_cell(&mut tail, i, &mut(*thread_handle).spare);
+
+                if (*cell).enq_req.compare_exchange(
+                    null_mut(), enq_req, 
+                    Ordering::SeqCst, Ordering::SeqCst
+                ).is_ok() {
+                    if enq_req.id.compare_exchange(
+                        index, -i,
+                        Ordering::Relaxed, Ordering::Relaxed
+                    ).is_ok() {
+                        index = -i;
+                    }
+                    break;
+                }
+
+                if enq_req.id.load(Ordering::Relaxed) <= 0 {
+                    break;
+                }
+            }
+
+            index = - enq_req.id.load(Ordering::Relaxed);
+            cell = self.inner.find_cell(&mut thread_handle.tail_node, index, &mut thread_handle.spare);
+            if index > i {
+                let tail = self.inner.tail.load(Ordering::Relaxed);
+                while tail <= index {
+                    if self.inner.tail.compare_exchange(tail, index + 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                        break;
+                    }
+                }
+            }
+            (*cell).value.store(value, Ordering::Relaxed);
+        }
+
+    }
+}
+
+pub struct Consumer<T: Sized + Send> {
+    inner: Arc<UnboundedMPMCQueue<T>>,
+}
+
+unsafe impl<T: Send> Send for Consumer<T> {}
+
+impl<T: Sized + Send> Consumer<T> {
+    fn dequeue(&self, thread_handle: &mut Handle<T>) -> Box<T> {
+        let id = 0;
+        let mut p = MAX_PATIENCE;
+
+        loop {
+            
+        }
+    }
+
+    fn dequeue_fast(&self, value: &mut T, thread_handle: &mut Handle<T>, index: &mut isize) -> Result<(), ()> {
+        let i = self.inner.head.fetch_add(1, Ordering::SeqCst);
+        let cell = self.inner.find_cell(&mut thread_handle.head_node, i, &mut thread_handle.spare);
+        let cell = unsafe{ &mut(*cell) };
+        let value = self.help_enq(thread_handle, cell, i);
+        
+    }
+
+    fn help_enq(&self, thread_handle: &mut Handle<T>, cell: &mut Cell<T>, i: isize) -> Box<T> {
+        unsafe {
+            let state = {
+                let mut patience = MAX_SPIN;
+                let mut state;
+                loop {
+                    state = (*cell).value.load(Ordering::Acquire); 
+                    if state != Value::BOT && state != Value::TOP {
+                        break;
+                    }
+                    patience -= 1;
+                    if patience == 0 {
+                        break;
+                    }
+                    pause();
+                }
+
+                state
+            };
+
+            // TODO: assert!(state in [TOP, BOT]);
+
+            match state {
+                Value::BOT => {
+                    match (*cell).value.compare_exchange(
+                        Value::BOT, Value::TOP, 
+                        Ordering::SeqCst, Ordering::SeqCst
+                    ) {
+                        Ok(Value::BOT) => (),
+                        Ok(_) => unreachable!(),
+                        Err(Value::TOP) => (),
+                        Err(Value::BOT) => unreachable!(),
+                        Err(value) => return Box::from_raw(value),
+                    }
+                },
+                Value::TOP => (),
+                value => { return Box::from_raw(value); }, 
+            }
+
+            // TODO: assert!(state == Value::TOP);
+            let e = cell.enq_req.load(Ordering::Relaxed);
+
+            if e == EnqueueRequest::BOT {
+                let ph = &mut *thread_handle.eh;
+                let pe = &mut ph.enq_req;
+                let id = (*pe).id.load(Ordering::Relaxed);
+                
+                if thread_handle.tail.load(Ordering::Relaxed) != 0 && thread_handle.tail.load(Ordering::Relaxed) != id {
+                    thread_handle.tail.store(0, Ordering::Relaxed);
+                    thread_handle.eh = ph.next;
+                    ph = &mut *thread_handle.eh;
+                    pe = &mut ph.enq_req;
+                } 
+
+                if id > 0 && id <= i && cell.enq_req.compare_exchange(e, pe, Ordering::Relaxed, Ordering::Relaxed).is_err_and(|inner| {
+                    e = inner;
+                    return e != pe;
+                }) {
+                    thread_handle.tail.store(id, Ordering::Relaxed);
+                } else {
+                    thread_handle.tail.store(0, Ordering::Relaxed);
+                }
+
+                if e == null_mut() && cell.enq_req.compare_exchange(e, EnqueueRequest::TOP, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                    e = EnqueueRequest::TOP;
+                }
+            }
+
+            if e == EnqueueRequest::TOP {
+                if self.inner.tail.load(Ordering::Relaxed) <= i {
+                    return Value::BOT;
+                } else {
+                    return Value::TOP;
+                }
+            }
+
+            let ei = cell;
+
+
+            ()
+        }
+
+
+    }
+}
