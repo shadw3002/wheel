@@ -1,11 +1,12 @@
 #![feature(negative_impls)]
 #![feature(associated_type_defaults)]
-#![feature(asm)]
 #![feature(is_some_and)]
+#![feature(integer_atomics)]
 
 extern crate atomic;
 
-pub mod spinlock;
+mod util;
+
 pub mod spsc;
 pub mod mpmc;
 

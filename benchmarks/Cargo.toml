@@ -1,0 +1,16 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+atomicring = "1.2.9"
+bus = "2.3.0"
+wheel = { path = ".." }
+crossbeam = "0.8"
+
+[[bin]]
+name = "lscq"
+path = "lscq.rs"
+doc = false
