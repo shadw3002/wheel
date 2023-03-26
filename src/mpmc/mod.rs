@@ -70,6 +70,12 @@ struct Ring<T: Sized + Send> {
     cells: [Cell; RING_SIZE],
 }
 
+impl<T: Sized + Send> Drop for Ring<T> {
+    fn drop(&mut self) {
+        debug_assert!(self.dequeue().is_none());
+    }
+}
+
 
 impl<T: Sized + Send> Ring<T> {
     pub fn new() -> Self {
@@ -86,7 +92,7 @@ impl<T: Sized + Send> Ring<T> {
         loop {
             let raw_tail = self.tail.fetch_add(1, Ordering::AcqRel);
             let tail = raw_tail & ((1 << 63) - 1);
-            let is_closed = (raw_tail & (1 << 63)) == (1 << 63);
+            let is_closed = (raw_tail & (1 << 63)) != 0;
             if is_closed {
                 return Err(entry)
             }
@@ -96,6 +102,7 @@ impl<T: Sized + Send> Ring<T> {
             let tail_cycle = tail / RING_SIZE as u64;
             
             loop {
+                // enqueue do not need data, if this entry is empty, we can assume the data is also empty.
                 let (is_safe, is_empty, cell_cycle, flags) = cell.flags();
                 if cell_cycle < tail_cycle && is_empty && (is_safe ||self.head.load(Ordering::Acquire) <= tail) {
                     // We can use this entry for adding new data if
@@ -107,7 +114,7 @@ impl<T: Sized + Send> Ring<T> {
                     let old = Cell::new(flags, 0);
                     let new = Cell::new(Cell::new_flags(true, false, tail_cycle), entry_ptr as u64);
                     // Save input data into this entry.
-                    debug_assert_eq!(cell.data.load(Ordering::Acquire), 0);
+                    // debug_assert_eq!(cell.data.load(Ordering::Acquire), 0);
                     if cell.as_u128().compare_exchange(
                         old.as_u128().load(Ordering::Relaxed), 
                         new.as_u128().load(Ordering::Relaxed), 
@@ -192,6 +199,7 @@ impl<T: Sized + Send> Ring<T> {
 
     fn remap(origin: u64) -> usize {
         let inner = origin as usize % RING_SIZE;
+        return inner;
         const RING_CELLS_SIZE: usize = RING_SIZE * core::mem::size_of::<Cell>();
         const NUM_CACHELINE_PER_RING_CELLS: usize = RING_CELLS_SIZE / CACHELINE_SIZE;
         const NUM_CELLS_PER_CACHELINE: usize = CACHELINE_SIZE / core::mem::size_of::<Cell>();
@@ -298,7 +306,6 @@ impl<T: Sized + Send> Producer<T> {
                 Ok(_) => {
                     core::mem::forget(new_ring);
 
-                    debug_assert!(ring_ptr.is_some());
                     let _ = self.inner.tail.compare_exchange(
                         unsafe{ ring_ptr.unwrap_unchecked() }, 
                         new_ring_ptr, 

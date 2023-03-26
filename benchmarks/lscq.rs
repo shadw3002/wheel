@@ -75,9 +75,10 @@ fn mpsc() {
 fn mpmc() {
     let q = UnboundedMPMCQueue::new();
     let (producer, consumer) = q.split();
+    let (producer, consumer) = (&producer, &consumer);
 
     crossbeam::scope(|scope| {
-        for _ in 0..THREADS {
+        for t in 0..THREADS {
             scope.spawn(|_| {
                 for i in 0..MESSAGES / THREADS {
                     producer.enqueue(Box::new(message::new(i)));
@@ -85,11 +86,12 @@ fn mpmc() {
             });
         }
 
-        for _ in 0..THREADS {
-            scope.spawn(|_| {
+        for t in 0..THREADS {
+            scope.spawn(move |_| {
                 for i in 0..MESSAGES / THREADS {
                     loop {
                         if consumer.dequeue().is_none() {
+                            println!("thread: {}: miss: {}", t, i);
                             thread::yield_now();
                         } else {
                             break;
@@ -117,8 +119,8 @@ fn main() {
         };
     }
 
-    run!("unbounded_seq", seq());
-    run!("unbounded_spsc", spsc());
-    run!("unbounded_mpsc", mpsc());
+    // run!("unbounded_seq", seq());
+    // run!("unbounded_spsc", spsc());
+    // run!("unbounded_mpsc", mpsc());
     run!("unbounded_mpmc", mpmc());
 }
