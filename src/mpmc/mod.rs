@@ -1,8 +1,11 @@
 use core::sync::atomic::{Ordering, AtomicPtr, AtomicU64, AtomicI64, AtomicU128};
+use std::sync::Mutex;
 use std::ptr::null_mut;
 use std::sync::Arc;
 use std::usize;
 use crossbeam_utils::CachePadded;
+use crossbeam_epoch::{Atomic, pin, Shared, Owned};
+
 
 const RING_SIZE: usize = 128; // 65536;
 const CACHELINE_SIZE: usize = core::mem::size_of::<CachePadded<bool>>();
@@ -61,29 +64,88 @@ impl Cell{
     }
 }
 
-struct Ring<T: Sized + Send> {
+type Ring<T: Sized + Send> = RingSimple<T>;
+
+struct RingSimple<T: Sized + Send> {
+    data: CachePadded<AtomicPtr<T>>,
+    next: CachePadded<Atomic<Ring<T>>>,
+    tail: CachePadded<AtomicU64>,
+    threshold: CachePadded<AtomicI64>,
+}
+
+impl<T: Sized + Send> RingSimple<T> {
+    pub fn new() -> Self {
+        // println!("newing simple ring");
+        Self { 
+            data: CachePadded::new(AtomicPtr::new(null_mut())),
+            next: CachePadded::new(Atomic::null()), 
+            tail: CachePadded::new(AtomicU64::new(0)),
+            threshold: CachePadded::new(AtomicI64::new(0)),
+        }
+    }
+
+    pub fn enqueue(&self, entry: Box<T>) -> Result<(), Box<T>> {
+        if self.is_close() {
+            return Err(entry);
+        }
+        let entry_ptr = Box::into_raw(entry);
+        match self.data.compare_exchange(null_mut(), entry_ptr, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => Ok(()),
+            Err(_) => unsafe{ Err(Box::from_raw(entry_ptr)) },
+        }
+    }
+
+    pub fn dequeue(&self) -> Option<Box<T>> {
+        let entry_ptr = self.data.load(Ordering::Acquire);
+        if entry_ptr == null_mut() {
+            return None;
+        }
+        match self.data.compare_exchange(entry_ptr, null_mut(), Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => Some(unsafe{ Box::from_raw(entry_ptr) }),
+            Err(_) => None,
+        }
+    }
+
+    pub fn close(&self) {
+        self.tail.fetch_or(1 << 63, Ordering::Release);
+    }
+
+    fn is_close(&self) -> bool {
+        return (self.tail.load(Ordering::Acquire) & (1 << 63)) != 0;
+    }
+}
+
+
+impl<T: Sized + Send> Drop for RingSimple<T> {
+    fn drop(&mut self) {
+        println!("dropping simple ring");
+        debug_assert_eq!(self.data.load(Ordering::Acquire), null_mut());
+    }
+}
+
+struct SCQRing<T: Sized + Send> {
     head: CachePadded<AtomicU64>,
     tail: CachePadded<AtomicU64>,
     threshold: CachePadded<AtomicI64>,
-    next: CachePadded<AtomicPtr<Ring<T>>>,
+    next: CachePadded<Atomic<Ring<T>>>,
 
     cells: [Cell; RING_SIZE],
 }
 
-impl<T: Sized + Send> Drop for Ring<T> {
+impl<T: Sized + Send> Drop for SCQRing<T> {
     fn drop(&mut self) {
         debug_assert!(self.dequeue().is_none());
     }
 }
 
 
-impl<T: Sized + Send> Ring<T> {
+impl<T: Sized + Send> SCQRing<T> {
     pub fn new() -> Self {
         Self { 
             head: CachePadded::new(AtomicU64::new(RING_SIZE as u64)), 
             tail: CachePadded::new(AtomicU64::new(RING_SIZE as u64)), 
             threshold: CachePadded::new(AtomicI64::new(-1)), 
-            next: CachePadded::new(AtomicPtr::new(null_mut())), 
+            next: CachePadded::new(Atomic::null()), 
             cells: [(); RING_SIZE].map(|_| Cell::new(Cell::new_flags(true, true, 0), 0)),
         }
     }
@@ -225,21 +287,33 @@ impl<T: Sized + Send> Ring<T> {
             }
         }
     }
+
+    pub fn close(&self) {
+        self.tail.fetch_or(1 << 63, Ordering::Release);
+    }
+
+    fn is_close(&self) -> bool {
+        return (self.tail.load(Ordering::Acquire) & (1 << 63)) != 0;
+    }
 }
 
 pub struct UnboundedMPMCQueue<T: Sized + Send> {
-    head: AtomicPtr<Ring<T>>,
-    tail: AtomicPtr<Ring<T>>,
+    head: CachePadded<Atomic<Ring<T>>>,
+    tail: CachePadded<Atomic<Ring<T>>>,
 }
 
 impl<T: Sized + Send> UnboundedMPMCQueue<T> {
     pub fn new() -> Self {
-        let ring_ptr = Box::into_raw(Box::new(Ring::new()));
-        let res = Self {
-            head: AtomicPtr::new(ring_ptr),
-            tail: AtomicPtr::new(ring_ptr),
+        let queue = Self {
+            head: CachePadded::new(Atomic::null()),
+            tail: CachePadded::new(Atomic::null()),
         };
-        res
+        let guard = &pin();
+        let ring = Owned::new(Ring::new()).into_shared(guard);
+        queue.head.store(ring, Ordering::Release);
+        queue.tail.store(ring, Ordering::Release);
+
+        queue
     }
 
     pub fn split(self) -> (Producer<T>, Consumer<T>) {
@@ -259,23 +333,25 @@ unsafe impl<T: Send> Send for Producer<T> {}
 
 impl<T: Sized + Send> Producer<T> {
     pub fn enqueue(&self, mut entry: Box<T>) {
+        let guard = &pin();
+
         let mut ring_ptr = None;
         loop {
-            if ring_ptr.is_none() {
-                ring_ptr = Some(self.inner.tail.load(Ordering::Acquire));
-            }
-            let ring = unsafe{&*(ring_ptr.unwrap_unchecked() as *const Ring<T>)};
-            let mut next_ring_ptr = ring.next.load(Ordering::Acquire);
-            if next_ring_ptr != null_mut() {
+            ring_ptr = Some(*ring_ptr.get_or_insert_with(|| self.inner.tail.load(Ordering::Acquire, &guard)));
+            let ring = unsafe{ ring_ptr.unwrap_unchecked().as_ref().unwrap_unchecked() };
+            
+            let mut next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
+            if !next_ring_ptr.is_null() {
 			    // help move cq.next into tail.
                 ring_ptr = match self.inner.tail.compare_exchange(
                     unsafe{ ring_ptr.unwrap_unchecked() }, 
                     next_ring_ptr, 
                     Ordering::AcqRel, 
                     Ordering::Acquire,
+                    &guard,
                 ) {
                     Ok(_) => Some(next_ring_ptr),
-                    Err(new_tail) => Some(new_tail),
+                    Err(err) => Some(err.new),
                 };
                 
 			    continue
@@ -286,39 +362,42 @@ impl<T: Sized + Send> Producer<T> {
                 Err(entry) => entry, // concurrent cq is full
             };
             // close cq, subsequent enqueue will fail
-            ring.tail.fetch_or(1 << 63, Ordering::Release);
+            ring.close();
 
-            next_ring_ptr = ring.next.load(Ordering::Acquire);
-            if next_ring_ptr!= null_mut() {
+            next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
+            if !next_ring_ptr.is_null() {
                 ring_ptr = Some(next_ring_ptr);
                 continue;
             }
 
-            let new_ring_ptr = Box::into_raw(Box::new(Ring::<T>::new()));
-            let new_ring = unsafe{ Box::from_raw(new_ring_ptr) };
+            let new_ring_ptr = Owned::new(Ring::new()).into_shared(&guard);
+            let new_ring = unsafe{ new_ring_ptr.as_ref().unwrap_unchecked() };
             let _res = new_ring.enqueue(entry).is_ok();
             debug_assert!(_res);
             match ring.next.compare_exchange(
-                null_mut(), 
-                new_ring_ptr, Ordering::AcqRel, 
+                Shared::null(), 
+                new_ring_ptr, 
+                Ordering::AcqRel, 
                 Ordering::Acquire,
+                &guard,
             ) {
                 Ok(_) => {
-                    core::mem::forget(new_ring);
-
                     let _ = self.inner.tail.compare_exchange(
                         unsafe{ ring_ptr.unwrap_unchecked() }, 
                         new_ring_ptr, 
                         Ordering::AcqRel, 
                         Ordering::Relaxed,
+                        &guard,
                     );
                     return;
                 },
-                Err(new_next) => {
-                    ring_ptr = Some(new_next);
+                Err(err) => {
+                    ring_ptr = Some(err.new);
                 }
             }
             entry = unsafe{ new_ring.dequeue().unwrap_unchecked() };
+
+            guard.flush();
         }
     }
 }
@@ -331,19 +410,19 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T: Sized + Send> Consumer<T> {
     pub fn dequeue(&self) -> Option<Box<T>> {
+        let guard = pin();
+
         let mut ring_ptr = None;
         loop {
-            if ring_ptr.is_none() {
-                ring_ptr = Some(self.inner.head.load(Ordering::Acquire));
-            }
-            let ring = unsafe{ &*(ring_ptr.unwrap_unchecked() as *const Ring<T>) };
+            ring_ptr = Some(*ring_ptr.get_or_insert_with(|| self.inner.head.load(Ordering::Acquire, &guard)));
+            let ring = unsafe{ ring_ptr.unwrap_unchecked().as_ref().unwrap_unchecked() };
 
             if let Some(entry) = ring.dequeue() {
                 return Some(entry);
             }
 
-            let next_ring_ptr = ring.next.load(Ordering::Acquire);
-            if next_ring_ptr == null_mut() {
+            let next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
+            if next_ring_ptr.is_null() {
                 return None;
             }
 
@@ -354,20 +433,17 @@ impl<T: Sized + Send> Consumer<T> {
                 return Some(entry);
             }
 
-            match self.inner.head.compare_exchange(
+            ring_ptr = Some(match self.inner.head.compare_exchange(
                 unsafe{ ring_ptr.unwrap_unchecked() }, 
                 next_ring_ptr, 
                 Ordering::AcqRel, 
                 Ordering::Acquire,
+                &guard,
             ) {
-                Ok(_) => {
-                    unsafe{ drop(Box::from_raw(ring_ptr.unwrap_unchecked())); }
-                    ring_ptr = Some(next_ring_ptr);
-                },
-                Err(new_head) => {
-                    ring_ptr = Some(new_head);
-                }
-            }
+                Ok(_) => next_ring_ptr,
+                Err(err) => err.new,
+            });
+            guard.flush();
         }
     }
 }

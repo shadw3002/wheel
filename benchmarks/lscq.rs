@@ -56,13 +56,16 @@ fn mpsc() {
                 for i in 0..MESSAGES / THREADS {
                     producer.enqueue(Box::new(message::new(i)));
                 }
+
+                println!("write done");
             });
         }
 
-        for _ in 0..MESSAGES {
+        for i in 0..MESSAGES {
             loop {
                 if consumer.dequeue().is_none() {
                     thread::yield_now();
+                    // println!("miss: {}", i);
                 } else {
                     break;
                 }
@@ -79,8 +82,9 @@ fn mpmc() {
 
     crossbeam::scope(|scope| {
         for t in 0..THREADS {
-            scope.spawn(|_| {
+            scope.spawn(move |_| {
                 for i in 0..MESSAGES / THREADS {
+                    // println!("thread: {}: producing: {}", t, i);
                     producer.enqueue(Box::new(message::new(i)));
                 }
             });
@@ -90,11 +94,15 @@ fn mpmc() {
             scope.spawn(move |_| {
                 for i in 0..MESSAGES / THREADS {
                     loop {
-                        if consumer.dequeue().is_none() {
-                            println!("thread: {}: miss: {}", t, i);
-                            thread::yield_now();
-                        } else {
-                            break;
+                        match consumer.dequeue() {
+                            Some(entry) => {
+                                println!("thread: {}: get: {}", t, entry.0[0]);
+                                break;
+                            },
+                            None => {
+                                // println!("thread: {}: miss: {}", t, i);
+                                thread::yield_now();
+                            },
                         }
                     }
                 }
@@ -121,6 +129,6 @@ fn main() {
 
     // run!("unbounded_seq", seq());
     // run!("unbounded_spsc", spsc());
-    // run!("unbounded_mpsc", mpsc());
-    run!("unbounded_mpmc", mpmc());
+    run!("unbounded_mpsc", mpsc());
+    // run!("unbounded_mpmc", mpmc());
 }

@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 atomic = "0.5"
 crossbeam-utils = "0.8"
+crossbeam-epoch = "0.9"

@@ -243,6 +243,7 @@ name = "wheel"
 version = "0.1.0"
 dependencies = [
  "atomic",
+ "crossbeam-epoch",
  "crossbeam-utils",
 ]
 
