@@ -1,7 +1,7 @@
 #![feature(integer_atomics)]
 
 use wheel::mpmc::{UnboundedMPMCQueue, Cell};
-use std::thread;
+use std::{thread, time, cmp::Ordering};
 
 mod message;
 
@@ -65,11 +65,46 @@ fn mpsc() {
             loop {
                 if consumer.dequeue().is_none() {
                     thread::yield_now();
-                    // println!("miss: {}", i);
+                    println!("miss: {}", i);
                 } else {
                     break;
                 }
             }
+        }
+    })
+    .unwrap();
+}
+
+fn spmc() {
+    let q = UnboundedMPMCQueue::new();
+    let (producer, consumer) = q.split();
+    let (producer, consumer) = (&producer, &consumer);
+
+    crossbeam::scope(|scope| {
+        scope.spawn(|_| {
+            for i in 0..MESSAGES {
+                producer.enqueue(Box::new(message::new(i)));
+            }
+
+            println!("write done");
+        });
+
+        for t in 0..THREADS {
+            scope.spawn(move |_| {
+                for i in 0..MESSAGES / THREADS {
+                    loop {
+                        match consumer.dequeue() {
+                            Some(entry) => {
+                                break;
+                            },
+                            None => {
+                                println!("thread: {}: miss: {}", t, i);
+                                thread::yield_now();
+                            },
+                        }
+                    }
+                }
+            });
         }
     })
     .unwrap();
@@ -87,25 +122,34 @@ fn mpmc() {
                     // println!("thread: {}: producing: {}", t, i);
                     producer.enqueue(Box::new(message::new(i)));
                 }
+                println!("write done");
             });
         }
 
         for t in 0..THREADS {
             scope.spawn(move |_| {
+                println!("start reading");
                 for i in 0..MESSAGES / THREADS {
                     loop {
                         match consumer.dequeue() {
                             Some(entry) => {
-                                println!("thread: {}: get: {}", t, entry.0[0]);
                                 break;
                             },
                             None => {
-                                // println!("thread: {}: miss: {}", t, i);
+                                let enqs = consumer.inner.enqs.load(core::sync::atomic::Ordering::Acquire);
+                                let deqs = consumer.inner.deqs.load(core::sync::atomic::Ordering::Acquire);
+                                let new_rings = consumer.inner.new_rings.load(core::sync::atomic::Ordering::Acquire);
+                                let drop_rings = consumer.inner.drop_rings.load(core::sync::atomic::Ordering::Acquire);
+                                
+                                println!("thread: {}: miss: {}, enqs: {}, deqs: {}, new_rings: {}, drop_rings: {}", t, i, enqs, deqs, new_rings, drop_rings);
                                 thread::yield_now();
                             },
                         }
                     }
                 }
+                thread::sleep(time::Duration::from_secs(20));
+                println!("checking");
+                consumer.inner.check();
             });
         }
     })
@@ -129,6 +173,7 @@ fn main() {
 
     // run!("unbounded_seq", seq());
     // run!("unbounded_spsc", spsc());
-    run!("unbounded_mpsc", mpsc());
-    // run!("unbounded_mpmc", mpmc());
+    // run!("unbounded_mpsc", spmc());
+    // run!("unbounded_mpsc", mpsc());
+    run!("unbounded_mpmc", mpmc());
 }
