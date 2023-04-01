@@ -39,7 +39,7 @@ impl Cell{
     }
 
     pub fn flags(&self) -> (bool, bool, u64, u64) {
-        let flags = self.flags.load(Ordering::SeqCst);
+        let flags = self.flags.load(Ordering::Acquire);
         let is_safe = (flags & (1 << 63)) != 0;
         let is_empty = (flags & (1 << 62)) != 0;
         let cycle = flags & ((1 << 62) - 1);
@@ -53,80 +53,18 @@ impl Cell{
     pub fn from_u128(mut raw: u128) -> Self {
         let cell = unsafe{  &*(&mut raw as *mut u128 as *mut Cell) };
         Self { 
-            flags: AtomicU64::new(cell.flags.load(Ordering::SeqCst)), 
-            data: AtomicU64::new(cell.data.load(Ordering::SeqCst)),
+            flags: AtomicU64::new(cell.flags.load(Ordering::Relaxed)), 
+            data: AtomicU64::new(cell.data.load(Ordering::Relaxed)),
         }
     }
 
     pub fn reset(&self) {
-        self.data.store(0, Ordering::SeqCst);
-        self.flags.store(Self::new_flags(true, true, 0), Ordering::SeqCst);
+        self.data.store(0, Ordering::Release);
+        self.flags.store(Self::new_flags(true, true, 0), Ordering::Release);
     }
 }
 
-type Ring<T: Sized + Send> = RingSimple<T>;
-
-struct RingSimple<T: Sized + Send> {
-    mutex: Mutex<()>,
-    data: CachePadded<AtomicPtr<T>>,
-    next: CachePadded<Atomic<Ring<T>>>,
-    tail: CachePadded<AtomicU64>,
-    threshold: CachePadded<AtomicI64>,
-}
-
-impl<T: Sized + Send> RingSimple<T> {
-    pub fn new() -> Self {
-        // println!("newing simple ring");
-        Self { 
-            mutex: Mutex::new(()),
-            data: CachePadded::new(AtomicPtr::new(null_mut())),
-            next: CachePadded::new(Atomic::null()), 
-            tail: CachePadded::new(AtomicU64::new(0)),
-            threshold: CachePadded::new(AtomicI64::new(0)),
-        }
-    }
-
-    pub fn enqueue(&self, entry: Box<T>) -> Result<(), Box<T>> {
-        let guard = self.mutex.lock().unwrap();
-        if self.is_close() {
-            return Err(entry);
-        }
-        let entry_ptr = Box::into_raw(entry);
-        match self.data.compare_exchange(null_mut(), entry_ptr, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => Ok(()),
-            Err(_) => unsafe{ Err(Box::from_raw(entry_ptr)) },
-        }
-    }
-
-    pub fn dequeue(&self) -> Option<Box<T>> {
-        let entry_ptr = self.data.load(Ordering::SeqCst);
-        if entry_ptr == null_mut() {
-            return None;
-        }
-        match self.data.compare_exchange(entry_ptr, null_mut(), Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => Some(unsafe{ Box::from_raw(entry_ptr) }),
-            Err(_) => None,
-        }
-    }
-
-    pub fn close(&self) {
-        self.tail.fetch_or(1 << 63, Ordering::SeqCst);
-    }
-
-    fn is_close(&self) -> bool {
-        return (self.tail.load(Ordering::SeqCst) & (1 << 63)) != 0;
-    }
-}
-
-
-impl<T: Sized + Send> Drop for RingSimple<T> {
-    fn drop(&mut self) {
-        println!("dropping simple ring");
-        debug_assert_eq!(self.data.load(Ordering::SeqCst), null_mut());
-    }
-}
-
-struct SCQRing<T: Sized + Send> {
+struct Ring<T: Sized + Send> {
     head: CachePadded<AtomicU64>,
     tail: CachePadded<AtomicU64>,
     threshold: CachePadded<AtomicI64>,
@@ -135,14 +73,14 @@ struct SCQRing<T: Sized + Send> {
     cells: [Cell; RING_SIZE],
 }
 
-impl<T: Sized + Send> Drop for SCQRing<T> {
+impl<T: Sized + Send> Drop for Ring<T> {
     fn drop(&mut self) {
         debug_assert!(self.dequeue().is_none());
     }
 }
 
 
-impl<T: Sized + Send> SCQRing<T> {
+impl<T: Sized + Send> Ring<T> {
     pub fn new() -> Self {
         Self { 
             head: CachePadded::new(AtomicU64::new(RING_SIZE as u64)), 
@@ -179,10 +117,10 @@ impl<T: Sized + Send> SCQRing<T> {
                     let old = Cell::new(flags, 0);
                     let new = Cell::new(Cell::new_flags(true, false, tail_cycle), entry_ptr as u64);
                     // Save input data into this entry.
-                    // debug_assert_eq!(cell.data.load(Ordering::SeqCst), 0);
+                    // debug_assert_eq!(cell.data.load(Ordering::Acquire), 0);
                     if cell.as_u128().compare_exchange(
-                        old.as_u128().load(Ordering::Acquire), 
-                        new.as_u128().load(Ordering::Acquire), 
+                        old.as_u128().load(Ordering::Relaxed), 
+                        new.as_u128().load(Ordering::Relaxed), 
                         Ordering::AcqRel, 
                         Ordering::Relaxed,
                     ).is_err() {
@@ -210,37 +148,37 @@ impl<T: Sized + Send> SCQRing<T> {
     }
 
     pub fn dequeue(&self) -> Option<Box<T>> {
-        if self.threshold.load(Ordering::SeqCst) < 0 {
+        if self.threshold.load(Ordering::Acquire) < 0 {
             // Empty queue.
             return None
         }
 
         loop {
-            let raw_head = self.head.fetch_add(1, Ordering::SeqCst);
+            let raw_head = self.head.fetch_add(1, Ordering::AcqRel);
             let head = raw_head & ((1 << 63) - 1);        
             let cell_ref: &Cell = &self.cells[Self::remap(head)];
             let head_cycle = head / RING_SIZE as u64;
 
             loop {
-                let cell = Cell::from_u128(cell_ref.as_u128().load(Ordering::SeqCst));
+                let cell = Cell::from_u128(cell_ref.as_u128().load(Ordering::Acquire));
                 let (is_safe, is_empty, cell_cycle, _) = cell.flags();
                 if cell_cycle == head_cycle {
                     // clear data in this slot
                     cell_ref.reset();
                     return unsafe {
-                        Some(Box::from_raw(cell.data.load(Ordering::SeqCst) as *mut T))
+                        Some(Box::from_raw(cell.data.load(Ordering::Relaxed) as *mut T))
                     };
                 }
                 if cell_cycle < head_cycle {
                     let new_cell = match is_empty {
                         true => Cell::new(Cell::new_flags(is_safe, true, head_cycle), 0),
-                        false => Cell::new(Cell::new_flags(false, false, cell_cycle), cell.data.load(Ordering::SeqCst)),
+                        false => Cell::new(Cell::new_flags(false, false, cell_cycle), cell.data.load(Ordering::Relaxed)),
                     };
                     if cell_ref.as_u128().compare_exchange(
-                        cell.as_u128().load(Ordering::SeqCst), 
-                        new_cell.as_u128().load(Ordering::SeqCst), 
-                        Ordering::SeqCst, 
-                        Ordering::SeqCst
+                        cell.as_u128().load(Ordering::Relaxed), 
+                        new_cell.as_u128().load(Ordering::Relaxed), 
+                        Ordering::AcqRel, 
+                        Ordering::Relaxed
                     ).is_err() {
                         continue;
                     }
@@ -248,15 +186,15 @@ impl<T: Sized + Send> SCQRing<T> {
                 break;
             }
 
-            let raw_tail = self.tail.load(Ordering::SeqCst);
+            let raw_tail = self.tail.load(Ordering::Acquire);
             let tail = raw_tail & ((1 << 63) - 1);  
             if tail < head + 1 {
                 // invalid state
                 self.fix_state(head + 1);
-                self.threshold.fetch_add(-1, Ordering::SeqCst);
+                self.threshold.fetch_add(-1, Ordering::AcqRel);
                 return None;
             }
-            if self.threshold.fetch_add(-1, Ordering::SeqCst) <= 0 {
+            if self.threshold.fetch_add(-1, Ordering::AcqRel) <= 0 {
                 return None;
             }
         }
@@ -275,57 +213,46 @@ impl<T: Sized + Send> SCQRing<T> {
 
     fn fix_state(&self, original_head: u64) {
         loop {
-            let head = self.head.load(Ordering::SeqCst);
+            let head = self.head.load(Ordering::Acquire);
             if original_head < head {
                 // The last dequeuer will be responsible for fixstate.
                 return
             }
-            let tail = self.tail.load(Ordering::SeqCst);
+            let tail = self.tail.load(Ordering::Acquire);
             if tail >= head {
                 // The queue has been closed, or in normal state.
                 return 
             }
-            if self.tail.compare_exchange(tail, head, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if self.tail.compare_exchange(tail, head, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 return
             }
         }
     }
 
     pub fn close(&self) {
-        self.tail.fetch_or(1 << 63, Ordering::SeqCst);
+        self.tail.fetch_or(1 << 63, Ordering::Release);
     }
 
     fn is_close(&self) -> bool {
-        return (self.tail.load(Ordering::SeqCst) & (1 << 63)) != 0;
+        return (self.tail.load(Ordering::Acquire) & (1 << 63)) != 0;
     }
 }
 
 pub struct UnboundedMPMCQueue<T: Sized + Send> {
-    first: CachePadded<Atomic<Ring<T>>>,
     head: CachePadded<Atomic<Ring<T>>>,
     tail: CachePadded<Atomic<Ring<T>>>,
-    pub enqs: AtomicI64,
-    pub deqs: AtomicI64,
-    pub new_rings: AtomicI64,
-    pub drop_rings: AtomicI64,
 }
 
 impl<T: Sized + Send> UnboundedMPMCQueue<T> {
     pub fn new() -> Self {
         let queue = Self {
-            first: CachePadded::new(Atomic::null()),
             head: CachePadded::new(Atomic::null()),
             tail: CachePadded::new(Atomic::null()),
-            enqs: AtomicI64::new(0),
-            deqs: AtomicI64::new(0),
-            new_rings: AtomicI64::new(0),
-            drop_rings: AtomicI64::new(0),
         };
         let guard = &pin();
         let ring = Owned::new(Ring::new()).into_shared(guard);
-        queue.first.store(ring, Ordering::SeqCst);
-        queue.head.store(ring, Ordering::SeqCst);
-        queue.tail.store(ring, Ordering::SeqCst);
+        queue.head.store(ring, Ordering::Release);
+        queue.tail.store(ring, Ordering::Release);
 
         queue
     }
@@ -336,21 +263,6 @@ impl<T: Sized + Send> UnboundedMPMCQueue<T> {
             Producer{inner: inner.clone()},
             Consumer{inner},
         )
-    }
-
-    pub fn check(&self) {
-        loop {
-            let guard = &pin();
-            let now = self.first.load(Ordering::SeqCst, guard);
-            if now.is_null() {
-                break;
-            }
-            let ring = unsafe{ now.as_ref().unwrap() };
-            if ring.data.load(Ordering::SeqCst) != null_mut() {
-                panic!("unexpected");
-            }
-            self.first.store(ring.next.load(Ordering::SeqCst, guard), Ordering::SeqCst);
-        }
     }
 }
 
@@ -363,31 +275,31 @@ unsafe impl<T: Send> Send for Producer<T> {}
 impl<T: Sized + Send> Producer<T> {
     pub fn enqueue(&self, mut entry: Box<T>) {
         let guard = &pin();
-        guard.flush();
 
+        let mut ring_ptr = None;
         loop {
-            let ring_ptr = self.inner.tail.load(Ordering::Acquire, &guard);
-            let ring = unsafe{ ring_ptr.as_ref().unwrap_unchecked() };
+            ring_ptr = Some(*ring_ptr.get_or_insert_with(|| self.inner.tail.load(Ordering::Acquire, &guard)));
+            let ring = unsafe{ ring_ptr.unwrap_unchecked().as_ref().unwrap_unchecked() };
             
             let mut next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
             if !next_ring_ptr.is_null() {
 			    // help move cq.next into tail.
-                _ = self.inner.tail.compare_exchange(
-                    ring_ptr, 
+                ring_ptr = match self.inner.tail.compare_exchange(
+                    unsafe{ ring_ptr.unwrap_unchecked() }, 
                     next_ring_ptr, 
                     Ordering::AcqRel, 
-                    Ordering::Relaxed,
+                    Ordering::Acquire,
                     &guard,
-                );
+                ) {
+                    Ok(_) => Some(next_ring_ptr),
+                    Err(err) => Some(err.new),
+                };
                 
 			    continue
             }
 
             entry = match ring.enqueue(entry) {
-                Ok(_) => {
-                    self.inner.enqs.fetch_add(1, Ordering::AcqRel);
-                    return
-                },
+                Ok(_) => return,
                 Err(entry) => entry, // concurrent cq is full
             };
             // close cq, subsequent enqueue will fail
@@ -395,6 +307,7 @@ impl<T: Sized + Send> Producer<T> {
 
             next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
             if !next_ring_ptr.is_null() {
+                ring_ptr = Some(next_ring_ptr);
                 continue;
             }
 
@@ -402,31 +315,36 @@ impl<T: Sized + Send> Producer<T> {
             let new_ring = unsafe{ new_ring_ptr.as_ref().unwrap_unchecked() };
             let _res = new_ring.enqueue(entry).is_ok();
             debug_assert!(_res);
-            if ring.next.compare_exchange(
+            match ring.next.compare_exchange(
                 Shared::null(), 
                 new_ring_ptr, 
                 Ordering::AcqRel, 
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 &guard,
-            ).is_ok() {
-                let _ = self.inner.tail.compare_exchange(
-                    ring_ptr, 
-                    new_ring_ptr, 
-                    Ordering::AcqRel, 
-                    Ordering::Relaxed,
-                    &guard,
-                );
-                self.inner.enqs.fetch_add(1, Ordering::AcqRel);
-                self.inner.new_rings.fetch_add(1, Ordering::AcqRel);
-                return;
+            ) {
+                Ok(_) => {
+                    let _ = self.inner.tail.compare_exchange(
+                        unsafe{ ring_ptr.unwrap_unchecked() }, 
+                        new_ring_ptr, 
+                        Ordering::AcqRel, 
+                        Ordering::Relaxed,
+                        &guard,
+                    );
+                    return;
+                },
+                Err(err) => {
+                    ring_ptr = Some(err.new);
+                }
             }
             entry = unsafe{ new_ring.dequeue().unwrap_unchecked() };
+
+            guard.flush();
         }
     }
 }
 
 pub struct Consumer<T: Sized + Send> {
-    pub inner: Arc<UnboundedMPMCQueue<T>>,
+    inner: Arc<UnboundedMPMCQueue<T>>,
 }
 
 unsafe impl<T: Send> Send for Consumer<T> {}
@@ -434,7 +352,6 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 impl<T: Sized + Send> Consumer<T> {
     pub fn dequeue(&self) -> Option<Box<T>> {
         let guard = pin();
-        guard.flush();
 
         let mut ring_ptr = None;
         loop {
@@ -442,7 +359,6 @@ impl<T: Sized + Send> Consumer<T> {
             let ring = unsafe{ ring_ptr.unwrap_unchecked().as_ref().unwrap_unchecked() };
 
             if let Some(entry) = ring.dequeue() {
-                self.inner.deqs.fetch_add(1, Ordering::AcqRel);
                 return Some(entry);
             }
 
@@ -454,15 +370,10 @@ impl<T: Sized + Send> Consumer<T> {
             // cq.next is not empty, subsequent entry will be insert into cq.next instead of cq.
 		    // So if cq is empty, we can move it into ncqpool.
             ring.threshold.store((RING_SIZE as i64) * 2 - 1, Ordering::Release);
-            {
-                let guard = ring.mutex.lock().unwrap();
-                ring.close();
-                if let Some(entry) = ring.dequeue() {
-                    self.inner.deqs.fetch_add(1, Ordering::AcqRel);
-                    return Some(entry);
-                }
+            if let Some(entry) = ring.dequeue() {
+                return Some(entry);
             }
- 
+
             ring_ptr = Some(match self.inner.head.compare_exchange(
                 unsafe{ ring_ptr.unwrap_unchecked() }, 
                 next_ring_ptr, 
@@ -470,10 +381,10 @@ impl<T: Sized + Send> Consumer<T> {
                 Ordering::Acquire,
                 &guard,
             ) {
-                Ok(_) => {self.inner.drop_rings.fetch_add(1, Ordering::AcqRel); next_ring_ptr},
+                Ok(_) => next_ring_ptr,
                 Err(err) => err.new,
-            }); 
+            });
+            guard.flush();
         }
-        
     }
 }
