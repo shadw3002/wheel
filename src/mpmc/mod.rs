@@ -365,20 +365,25 @@ impl<T: Sized + Send> Producer<T> {
         let guard = &pin();
         guard.flush();
 
+        let mut ring_ptr = None;
         loop {
-            let ring_ptr = self.inner.tail.load(Ordering::Acquire, &guard);
-            let ring = unsafe{ ring_ptr.as_ref().unwrap_unchecked() };
+            ring_ptr = Some(*ring_ptr.get_or_insert_with(|| self.inner.tail.load(Ordering::Acquire, &guard)));
+            let ring = unsafe{ ring_ptr.unwrap_unchecked().as_ref().unwrap_unchecked() };
             
             let mut next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
             if !next_ring_ptr.is_null() {
 			    // help move cq.next into tail.
-                _ = self.inner.tail.compare_exchange(
-                    ring_ptr, 
+                ring_ptr = Some(match self.inner.tail.compare_exchange(
+                    unsafe{ ring_ptr.unwrap_unchecked() }, 
                     next_ring_ptr, 
                     Ordering::AcqRel, 
-                    Ordering::Relaxed,
+                    Ordering::Acquire,
                     &guard,
-                );
+                ) {
+                    Ok(_) => next_ring_ptr,
+                    Err(err) => err.current,
+                });
+                ring_ptr = None;
                 
 			    continue
             }
@@ -395,6 +400,8 @@ impl<T: Sized + Send> Producer<T> {
 
             next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
             if !next_ring_ptr.is_null() {
+                ring_ptr = Some(next_ring_ptr);
+                ring_ptr = None;
                 continue;
             }
 
@@ -402,23 +409,28 @@ impl<T: Sized + Send> Producer<T> {
             let new_ring = unsafe{ new_ring_ptr.as_ref().unwrap_unchecked() };
             let _res = new_ring.enqueue(entry).is_ok();
             debug_assert!(_res);
-            if ring.next.compare_exchange(
+            match ring.next.compare_exchange(
                 Shared::null(), 
                 new_ring_ptr, 
                 Ordering::AcqRel, 
-                Ordering::Relaxed,
+                Ordering::Acquire,
                 &guard,
-            ).is_ok() {
-                let _ = self.inner.tail.compare_exchange(
-                    ring_ptr, 
-                    new_ring_ptr, 
-                    Ordering::AcqRel, 
-                    Ordering::Relaxed,
-                    &guard,
-                );
-                self.inner.enqs.fetch_add(1, Ordering::AcqRel);
-                self.inner.new_rings.fetch_add(1, Ordering::AcqRel);
-                return;
+            ) {
+                Ok(_) => {
+                    let _ = self.inner.tail.compare_exchange(
+                        unsafe{ ring_ptr.unwrap_unchecked() }, 
+                        new_ring_ptr, 
+                        Ordering::AcqRel, 
+                        Ordering::Relaxed,
+                        &guard,
+                    );
+                    self.inner.enqs.fetch_add(1, Ordering::AcqRel);
+                    self.inner.new_rings.fetch_add(1, Ordering::AcqRel);
+                    return;
+                },
+                Err(err) => {
+                    ring_ptr = Some(err.current);
+                },
             }
             entry = unsafe{ new_ring.dequeue().unwrap_unchecked() };
         }
