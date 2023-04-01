@@ -383,7 +383,6 @@ impl<T: Sized + Send> Producer<T> {
                     Ok(_) => next_ring_ptr,
                     Err(err) => err.current,
                 });
-                ring_ptr = None;
                 
 			    continue
             }
@@ -401,7 +400,6 @@ impl<T: Sized + Send> Producer<T> {
             next_ring_ptr = ring.next.load(Ordering::Acquire, &guard);
             if !next_ring_ptr.is_null() {
                 ring_ptr = Some(next_ring_ptr);
-                ring_ptr = None;
                 continue;
             }
 
