@@ -2,6 +2,7 @@
 #![feature(associated_type_defaults)]
 #![feature(is_some_and)]
 #![feature(integer_atomics)]
+#![feature(thread_id_value)]
 
 extern crate atomic;
 

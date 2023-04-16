@@ -17,8 +17,7 @@ fn seq() {
     }
 
     for i in 0..MESSAGES {
-        let j = consumer.dequeue().unwrap().as_ref().0[0];
-        assert_eq!(i, j);
+        consumer.dequeue().unwrap();
     }
 }
 
@@ -56,8 +55,6 @@ fn mpsc() {
                 for i in 0..MESSAGES / THREADS {
                     producer.enqueue(Box::new(message::new(i)));
                 }
-
-                println!("write done");
             });
         }
 
@@ -65,7 +62,6 @@ fn mpsc() {
             loop {
                 if consumer.dequeue().is_none() {
                     thread::yield_now();
-                    println!("miss: {}", i);
                 } else {
                     break;
                 }
@@ -86,7 +82,6 @@ fn spmc() {
                 producer.enqueue(Box::new(message::new(i)));
             }
 
-            println!("write done");
         });
 
         for t in 0..THREADS {
@@ -98,7 +93,7 @@ fn spmc() {
                                 break;
                             },
                             None => {
-                                println!("thread: {}: miss: {}", t, i);
+                                // println!("thread: {}: miss: {}", t, i);
                                 thread::yield_now();
                             },
                         }
@@ -122,34 +117,24 @@ fn mpmc() {
                     // println!("thread: {}: producing: {}", t, i);
                     producer.enqueue(Box::new(message::new(i)));
                 }
-                println!("write done");
+                // println!("write done");
             });
         }
 
         for t in 0..THREADS {
             scope.spawn(move |_| {
-                println!("start reading");
                 for i in 0..MESSAGES / THREADS {
                     loop {
                         match consumer.dequeue() {
                             Some(entry) => {
                                 break;
                             },
-                            None => {
-                                let enqs = consumer.inner.enqs.load(core::sync::atomic::Ordering::Acquire);
-                                let deqs = consumer.inner.deqs.load(core::sync::atomic::Ordering::Acquire);
-                                let new_rings = consumer.inner.new_rings.load(core::sync::atomic::Ordering::Acquire);
-                                let drop_rings = consumer.inner.drop_rings.load(core::sync::atomic::Ordering::Acquire);
-                                
-                                println!("thread: {}: miss: {}, enqs: {}, deqs: {}, new_rings: {}, drop_rings: {}", t, i, enqs, deqs, new_rings, drop_rings);
+                            None => {             
                                 thread::yield_now();
                             },
                         }
                     }
                 }
-                thread::sleep(time::Duration::from_secs(20));
-                println!("checking");
-                consumer.inner.check();
             });
         }
     })
@@ -171,9 +156,9 @@ fn main() {
         };
     }
 
-    // run!("unbounded_seq", seq());
-    // run!("unbounded_spsc", spsc());
-    // run!("unbounded_mpsc", spmc());
+
+    // run!("unbounded_mpmc", mpmc());
     // run!("unbounded_mpsc", mpsc());
-    run!("unbounded_mpmc", mpmc());
+    run!("unbounded_seq", seq());
+    // run!("unbounded_spsc", spsc());
 }
