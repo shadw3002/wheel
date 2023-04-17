@@ -17,4 +17,4 @@ cd "$(dirname "$0")"
 # cargo run --release --bin atomicring | tee atomicring.txt
 # cargo run --release --bin bus | tee bus.txt
 # cargo run --release --bin crossbeam-deque | tee crossbeam-deque.txt
-cargo run --release --bin lscq | tee lscq.txt
+cargo run --release --bin lprq | tee lprq.txt

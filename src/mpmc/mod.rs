@@ -1,4 +1,4 @@
-use core::sync::atomic::{Ordering, AtomicPtr, AtomicU64, AtomicI64, AtomicU128};
+use core::sync::atomic::{Ordering, AtomicPtr, AtomicU64, AtomicI64};
 use std::sync::Mutex;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use crossbeam_epoch::{Atomic, pin, Shared, Owned};
 use arrayvec::ArrayVec;
 
 
-const RING_SIZE: usize = 65536;
+const RING_SIZE: usize = 1024;
 const CACHELINE_SIZE: usize = core::mem::size_of::<CachePadded<bool>>();
 
 #[repr(align(16))]
@@ -85,7 +85,7 @@ impl<T: Sized + Send> PCQRing<T> {
                         }
                         entry = unsafe{ Box::from_raw(entry_ptr) };
                     } else {
-                        cell.data.compare_exchange(bottom, 0, Ordering::AcqRel, Ordering::Relaxed);
+                        let _ = cell.data.compare_exchange(bottom, 0, Ordering::AcqRel, Ordering::Relaxed);
                     }
                 }
             }
@@ -280,7 +280,7 @@ impl<T: Sized + Send> Producer<T> {
             ) {
                 Ok(_) => {
                     let _ = self.inner.tail.compare_exchange(
-                        unsafe{ ring_ptr }, 
+                        ring_ptr, 
                         new_ring_ptr, 
                         Ordering::AcqRel, 
                         Ordering::Relaxed,
@@ -326,7 +326,7 @@ impl<T: Sized + Send> Consumer<T> {
             }
  
             ring_ptr = match self.inner.head.compare_exchange(
-                unsafe{ ring_ptr }, 
+                ring_ptr, 
                 next_ring_ptr, 
                 Ordering::AcqRel, 
                 Ordering::Acquire,
@@ -353,7 +353,7 @@ fn set_unsafe(v: u64) -> u64 {
 }
 
 fn node_index(v: u64) -> u64 {
-    return (v & ((1u64 << 63) - 1));
+    return v & ((1u64 << 63) - 1);
 }
 
 fn thread_local_bottom(tid: std::thread::ThreadId) -> u64 {

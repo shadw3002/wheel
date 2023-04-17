@@ -11,9 +11,6 @@ wheel = { path = ".." }
 crossbeam = "0.8"
 
 [[bin]]
-name = "lscq"
-path = "lscq.rs"
+name = "lprq"
+path = "lprq.rs"
 doc = false
-
-[profile.release]
-debug = true
