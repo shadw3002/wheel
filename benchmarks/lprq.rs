@@ -157,7 +157,7 @@ fn main() {
     }
 
 
-    run!("unbounded_mpmc", mpmc());
+    // run!("unbounded_mpmc", mpmc());
     // run!("unbounded_mpsc", mpsc());
     run!("unbounded_seq", seq());
     // run!("unbounded_spsc", spsc());

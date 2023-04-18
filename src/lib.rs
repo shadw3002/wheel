@@ -3,6 +3,8 @@
 #![feature(is_some_and)]
 #![feature(integer_atomics)]
 #![feature(thread_id_value)]
+#![feature(thread_local)]
+#![feature(core_intrinsics)]
 
 extern crate atomic;
 

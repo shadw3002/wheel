@@ -8,7 +8,7 @@ use crossbeam_epoch::{Atomic, pin, Shared, Owned};
 use arrayvec::ArrayVec;
 
 
-const RING_SIZE: usize = 1024;
+const RING_SIZE: usize = 65536;
 const CACHELINE_SIZE: usize = core::mem::size_of::<CachePadded<bool>>();
 
 #[repr(align(16))]
@@ -56,6 +56,7 @@ impl<T: Sized + Send> PCQRing<T> {
         }
     }
 
+    #[inline]
     fn close(&self, tail_ticket: u64, force: bool) -> bool {
         if !force {
             return self.tail.compare_exchange(tail_ticket+1, (tail_ticket + 1) | (1u64<<63), Ordering::SeqCst, Ordering::SeqCst).is_ok();
@@ -76,7 +77,7 @@ impl<T: Sized + Send> PCQRing<T> {
             let cell = &self.cells[remap(tail_ticket)];
             let (cell_ticket, cell_data) = (cell.idx.load(Ordering::Acquire), cell.data.load(Ordering::Acquire));
             if cell_data == 0 && node_index(cell_ticket) <= tail_ticket && (!is_unsafe(cell_ticket) || self.head.load(Ordering::Acquire) <= tail_ticket) {
-                let bottom = thread_local_bottom(std::thread::current().id());
+                let bottom = thread_local_bottom(ThreadId::current());
                 if cell.data.compare_exchange(cell_data, bottom, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                     if cell.idx.compare_exchange(cell_ticket, tail_ticket + RING_SIZE as u64, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                         let entry_ptr = Box::into_raw(entry);
@@ -158,7 +159,7 @@ impl<T: Sized + Send> PCQRing<T> {
     }
 
 
-
+    #[inline]
     fn fix_state(&self) {
         loop {
             let head = self.head.load(Ordering::SeqCst);
@@ -237,7 +238,6 @@ unsafe impl<T: Send> Send for Producer<T> {}
 impl<T: Sized + Send> Producer<T> {
     pub fn enqueue(&self, mut entry: Box<T>) {
         let guard = &pin();
-        guard.flush();
 
         let mut ring_ptr = self.inner.tail.load(Ordering::Acquire, &guard);
         loop {
@@ -306,7 +306,6 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 impl<T: Sized + Send> Consumer<T> {
     pub fn dequeue(&self) -> Option<Box<T>> {
         let guard = pin();
-        guard.flush();
 
         let mut ring_ptr = self.inner.head.load(Ordering::Acquire, &guard);
         loop {
@@ -340,30 +339,37 @@ impl<T: Sized + Send> Consumer<T> {
     }
 }
 
+#[inline]
 fn is_closed(v: u64) -> bool {
     return (v & (1u64 << 63)) != 0;
 }
 
+#[inline]
 fn is_unsafe(v: u64) -> bool {
     return (v & (1u64 << 63)) != 0;
 }
 
+#[inline]
 fn set_unsafe(v: u64) -> u64 {
     return v | (1u64 << 63);
 }
 
+#[inline]
 fn node_index(v: u64) -> u64 {
     return v & ((1u64 << 63) - 1);
 }
 
-fn thread_local_bottom(tid: std::thread::ThreadId) -> u64 {
-    (tid.as_u64().get() << 1) | 1
+#[inline]
+fn thread_local_bottom(tid: u64) -> u64 {
+    (tid << 1) | 1
 }
 
+#[inline]
 fn is_bottom(v: u64) -> bool {
     (v & 1) != 0
 }
 
+#[inline]
 fn remap(origin: u64) -> usize {
     const RING_CELLS_SIZE: usize = RING_SIZE * core::mem::size_of::<Cell>();
     const NUM_CACHELINE_PER_RING_CELLS: usize = RING_CELLS_SIZE / CACHELINE_SIZE;
@@ -372,4 +378,39 @@ fn remap(origin: u64) -> usize {
     let cacheline_inner_idx = inner / NUM_CACHELINE_PER_RING_CELLS;
     let cacheline_idx = inner % NUM_CACHELINE_PER_RING_CELLS;
     cacheline_idx * NUM_CELLS_PER_CACHELINE + cacheline_inner_idx
+}
+
+
+
+use std::thread;
+use core::cell;
+
+struct ThreadId {
+
+}
+
+impl ThreadId {
+    #[inline]
+    pub fn current() -> u64 {
+        #[thread_local]
+        static CACHED_ID: cell::Cell<u64> = cell::Cell::new(0);
+        // Try to have only one TLS read, even though LLVM will
+        // definitely emit two for the initial read
+        let cached = &CACHED_ID;
+        let id = cached.get();
+
+        if core::intrinsics::likely(id != 0) {
+            id
+        } else {
+            Self::get_and_cache(cached)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_and_cache(cache: &cell::Cell<u64>) -> u64 {
+        let id = thread::current().id().as_u64().get();
+        cache.set(id);
+        id
+    }
 }
