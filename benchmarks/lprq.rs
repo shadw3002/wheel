@@ -1,12 +1,24 @@
 #![feature(integer_atomics)]
 
-use wheel::mpmc::{UnboundedMPMCQueue, Cell};
+use wheel::mpmc::{UnboundedMPMCQueue, PCQRing};
 use std::{thread, time, cmp::Ordering};
 
 mod message;
 
-const MESSAGES: usize = 5_000_000;
+const MESSAGES: usize = 5_000_0;
 const THREADS: usize = 4;
+
+fn test() {
+    let ring = PCQRing::new();
+
+    for i in 0..MESSAGES {
+        ring.enqueue(Box::new(message::new(i)));
+    }
+
+    for i in 0..MESSAGES {
+        ring.dequeue().unwrap();
+    }
+}
 
 fn seq() {
     let q = UnboundedMPMCQueue::new();

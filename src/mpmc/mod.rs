@@ -4,8 +4,9 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::usize;
 use crossbeam_utils::CachePadded;
-use crossbeam_epoch::{Atomic, pin, Shared, Owned};
+use crossbeam_epoch::{Atomic, pin, Shared, Owned, Guard};
 use arrayvec::ArrayVec;
+use core::intrinsics::{likely, unlikely};
 
 
 const RING_SIZE: usize = 65536;
@@ -31,7 +32,7 @@ impl Cell{
 
 type Ring<T: Sized + Send> = PCQRing<T>;
 
-struct PCQRing<T: Sized + Send> {
+pub struct PCQRing<T: Sized + Send> {
     head: CachePadded<AtomicU64>,
     tail: CachePadded<AtomicU64>,
     next: CachePadded<Atomic<Ring<T>>>,
@@ -267,7 +268,7 @@ impl<T: Sized + Send> Producer<T> {
                 Err(entry) => entry, // concurrent cq is full
             };
 
-            let new_ring_ptr = Owned::new(Ring::new()).into_shared(&guard);
+            let new_ring_ptr = Self::new_ring_from_guard(guard);
             let new_ring = unsafe{ new_ring_ptr.as_ref().unwrap_unchecked() };
             let _res = new_ring.enqueue(entry).is_ok();
             debug_assert!(_res);
@@ -294,6 +295,11 @@ impl<T: Sized + Send> Producer<T> {
             }
             entry = unsafe{ new_ring.dequeue().unwrap_unchecked() };
         }
+    }
+
+    #[inline(never)]
+    fn new_ring_from_guard<'g>(guard: &'g Guard) -> Shared<'g, PCQRing<T>> {
+        Owned::new(Ring::new()).into_shared(&guard)
     }
 }
 
@@ -414,3 +420,4 @@ impl ThreadId {
         id
     }
 }
+
