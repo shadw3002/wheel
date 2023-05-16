@@ -1,36 +1,29 @@
 #![feature(integer_atomics)]
 
-use wheel::mpmc::{UnboundedMPMCQueue, PCQRing};
-use std::{thread, time, cmp::Ordering};
+use wheel::mpmc::UnboundedMPMCQueue;
+use std::thread;
 
 mod message;
 
-const MESSAGES: usize = 5_000_0;
+const MESSAGES: usize = 5_000_000;
 const THREADS: usize = 4;
-
-fn test() {
-    let ring = PCQRing::new();
-
-    for i in 0..MESSAGES {
-        ring.enqueue(Box::new(message::new(i)));
-    }
-
-    for i in 0..MESSAGES {
-        ring.dequeue().unwrap();
-    }
-}
 
 fn seq() {
     let q = UnboundedMPMCQueue::new();
     let (producer, consumer) = q.split();
+    let ptr = Box::into_raw(Box::new(message::new(0)));
 
-    for i in 0..MESSAGES {
-        producer.enqueue(Box::new(message::new(i)));
+
+    for _i in 0..MESSAGES {
+        producer.enqueue(unsafe{ Box::from_raw(ptr) });
     }
 
-    for i in 0..MESSAGES {
-        consumer.dequeue().unwrap();
+    for _i in 0..MESSAGES {
+        let b = consumer.dequeue().unwrap();
+        Box::into_raw(b);
     }
+
+    unsafe{ let _ = Box::from_raw(ptr); }
 }
 
 fn spsc() {
@@ -70,7 +63,7 @@ fn mpsc() {
             });
         }
 
-        for i in 0..MESSAGES {
+        for _i in 0..MESSAGES {
             loop {
                 if consumer.dequeue().is_none() {
                     thread::yield_now();
@@ -96,12 +89,12 @@ fn spmc() {
 
         });
 
-        for t in 0..THREADS {
+        for _t in 0..THREADS {
             scope.spawn(move |_| {
-                for i in 0..MESSAGES / THREADS {
+                for _i in 0..MESSAGES / THREADS {
                     loop {
                         match consumer.dequeue() {
-                            Some(entry) => {
+                            Some(_entry) => {
                                 break;
                             },
                             None => {
@@ -123,7 +116,7 @@ fn mpmc() {
     let (producer, consumer) = (&producer, &consumer);
 
     crossbeam::scope(|scope| {
-        for t in 0..THREADS {
+        for _t in 0..THREADS {
             scope.spawn(move |_| {
                 for i in 0..MESSAGES / THREADS {
                     // println!("thread: {}: producing: {}", t, i);
@@ -133,12 +126,12 @@ fn mpmc() {
             });
         }
 
-        for t in 0..THREADS {
+        for _t in 0..THREADS {
             scope.spawn(move |_| {
-                for i in 0..MESSAGES / THREADS {
+                for _i in 0..MESSAGES / THREADS {
                     loop {
                         match consumer.dequeue() {
-                            Some(entry) => {
+                            Some(_entry) => {
                                 break;
                             },
                             None => {             
@@ -169,8 +162,9 @@ fn main() {
     }
 
 
-    // run!("unbounded_mpmc", mpmc());
-    // run!("unbounded_mpsc", mpsc());
+    run!("unbounded_mpmc", mpmc());
+    run!("unbounded_mpsc", mpsc());
+    run!("unbounded_spmc", spmc());
     run!("unbounded_seq", seq());
-    // run!("unbounded_spsc", spsc());
+    run!("unbounded_spsc", spsc());
 }

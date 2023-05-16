@@ -1,7 +1,5 @@
 mod simple;
 
-use std::sync::mpsc::Sender;
-
 pub trait FixSizeSPSCQueue<'a, T, const N: usize, P, C> where Self: 'a {
   fn split(&'a mut self) -> (P, C) where P: Producer<'a, T, N>, C: Consumer<'a, T, N>;
 }

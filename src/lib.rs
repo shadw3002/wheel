@@ -5,6 +5,7 @@
 #![feature(thread_id_value)]
 #![feature(thread_local)]
 #![feature(core_intrinsics)]
+#![feature(new_uninit)]
 
 extern crate atomic;
 

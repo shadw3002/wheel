@@ -1,12 +1,8 @@
-use core::sync::atomic::{Ordering, AtomicPtr, AtomicU64, AtomicI64};
-use std::sync::Mutex;
-use std::ptr::null_mut;
+use core::sync::atomic::{Ordering, AtomicU64};
 use std::sync::Arc;
 use std::usize;
 use crossbeam_utils::CachePadded;
 use crossbeam_epoch::{Atomic, pin, Shared, Owned, Guard};
-use arrayvec::ArrayVec;
-use core::intrinsics::{likely, unlikely};
 
 
 const RING_SIZE: usize = 65536;
@@ -18,6 +14,7 @@ pub struct Cell {
     data: AtomicU64,
 }
 const CELL_SIZE: usize = core::mem::size_of::<Cell>();
+const BOX_SIZE: usize = core::mem::size_of::<Box<()>>();
 const _: () = assert!(CELL_SIZE == 16);
 const _: () = assert!(CACHELINE_SIZE % CELL_SIZE == 0);
 
@@ -48,13 +45,22 @@ impl<T: Sized + Send> Drop for PCQRing<T> {
 
 
 impl<T: Sized + Send> PCQRing<T> {
-    pub fn new() -> Self {
-        Self { 
-            head: CachePadded::new(AtomicU64::new(RING_SIZE as u64)), 
-            tail: CachePadded::new(AtomicU64::new(RING_SIZE as u64)), 
-            next: CachePadded::new(Atomic::null()), 
-            cells: unsafe{ [(); RING_SIZE].iter().enumerate().map(|i| Cell::new(i.0 as u64, 0)).collect::<ArrayVec<_, RING_SIZE>>().into_inner_unchecked() }, // TODO: remap
-        }
+    pub fn new() -> Box<Self> {
+        use std::alloc::{alloc, dealloc, Layout};
+
+        unsafe {
+            let layout = Layout::new::<Self>();
+            let ptr = alloc(layout) as *mut Self;
+    
+            (*ptr).head = CachePadded::new(AtomicU64::new(RING_SIZE as u64));
+            (*ptr).tail = CachePadded::new(AtomicU64::new(RING_SIZE as u64));
+            (*ptr).next = CachePadded::new(Atomic::null());
+            for (i, cell) in (*ptr).cells.iter_mut().enumerate() {
+                *cell = Cell::new(i as u64, 0);
+            }
+    
+            Box::from_raw(ptr)
+        }        
     }
 
     #[inline]
@@ -198,7 +204,7 @@ impl<T: Sized + Send> UnboundedMPMCQueue<T> {
             tail: CachePadded::new(Atomic::null()),
         };
         let guard = &pin();
-        let ring = Owned::new(Ring::new()).into_shared(guard);
+        let ring = unsafe{ Owned::from_raw(Box::into_raw(Ring::new())) }.into_shared(guard);
         queue.first.store(ring, Ordering::SeqCst);
         queue.head.store(ring, Ordering::SeqCst);
         queue.tail.store(ring, Ordering::SeqCst);
@@ -299,7 +305,7 @@ impl<T: Sized + Send> Producer<T> {
 
     #[inline(never)]
     fn new_ring_from_guard<'g>(guard: &'g Guard) -> Shared<'g, PCQRing<T>> {
-        Owned::new(Ring::new()).into_shared(&guard)
+        unsafe{ Owned::from_raw(Box::into_raw(Ring::new())) }.into_shared(&guard)
     }
 }
 
@@ -381,6 +387,7 @@ fn remap(origin: u64) -> usize {
     const NUM_CACHELINE_PER_RING_CELLS: usize = RING_CELLS_SIZE / CACHELINE_SIZE;
     const NUM_CELLS_PER_CACHELINE: usize = CACHELINE_SIZE / core::mem::size_of::<Cell>();
     let inner = origin as usize % RING_SIZE;
+    return inner;
     let cacheline_inner_idx = inner / NUM_CACHELINE_PER_RING_CELLS;
     let cacheline_idx = inner % NUM_CACHELINE_PER_RING_CELLS;
     cacheline_idx * NUM_CELLS_PER_CACHELINE + cacheline_inner_idx

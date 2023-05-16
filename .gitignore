@@ -2,3 +2,5 @@
 /Cargo.lock
 /benchmarks/target
 /benchmarks/1
+/benchmarks/*.txt
+/benchmarks/*.svg

@@ -14,6 +14,3 @@ crossbeam = "0.8"
 name = "lprq"
 path = "lprq.rs"
 doc = false
-
-[profile.release]
-opt-level = 3
